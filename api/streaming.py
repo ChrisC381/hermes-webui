@@ -3254,6 +3254,58 @@ def _resolve_streaming_terminal_scope_module():
     return None
 
 
+# The launch process's TERMINAL_* environment, frozen before any per-turn
+# environ mutation can run. A deployment launched with an env-only terminal
+# policy (TERMINAL_ENV=ssh from systemd / op run / a launcher bridge) has no
+# file to rebuild that policy from; this snapshot is the only way a bound
+# scope can keep it. Mirrors tui_gateway/launch_terminal_policy.py in the
+# Hermes agent (first capture wins, never re-read from ambient state).
+_LAUNCH_TERMINAL_ENV_SNAPSHOT: dict = {}
+
+
+def _capture_launch_terminal_env() -> dict:
+    """Freeze the process's TERMINAL_* env; the first capture wins."""
+    global _LAUNCH_TERMINAL_ENV_SNAPSHOT
+    if not _LAUNCH_TERMINAL_ENV_SNAPSHOT:
+        _LAUNCH_TERMINAL_ENV_SNAPSHOT = {
+            k: v for k, v in os.environ.items() if k.startswith("TERMINAL_")
+        }
+    return dict(_LAUNCH_TERMINAL_ENV_SNAPSHOT)
+
+
+def _frozen_launch_terminal_env() -> dict:
+    """The frozen launch TERMINAL_* overlay (empty when nothing was captured)."""
+    return dict(_LAUNCH_TERMINAL_ENV_SNAPSHOT)
+
+
+# Freeze at import: this module loads during app startup, before any streaming
+# turn can mirror a profile's runtime env into os.environ — the last moment
+# ambient environ is provably the launch process's own. (The multiplexed
+# gateway freezes at first-secondary-home instead; the WebUI's first turn may
+# itself be a routed profile, so import time is the equivalent point.)
+_capture_launch_terminal_env()
+
+
+def _is_process_owning_home(profile_home: str) -> bool:
+    """True when this turn's home IS the home this WebUI process serves as its own.
+
+    Only the owning home may borrow the launch env overlay; routed secondary
+    homes must resolve their policy from their own files alone (borrowing the
+    launch profile's env policy would recreate the cross-profile leak in the
+    other direction).
+    """
+    try:
+        from api.profiles import get_process_profile_home
+        import os as _os
+
+        _owner = _os.path.realpath(str(get_process_profile_home()))
+        _turn = _os.path.realpath(str(profile_home))
+        return _owner == _turn
+    except Exception:
+        logger.debug("process-owning-home comparison failed", exc_info=True)
+        return False
+
+
 def _set_streaming_terminal_scope(profile_home: str):
     """Install the turn's profile terminal policy as context-local state.
 
@@ -3268,6 +3320,19 @@ def _set_streaming_terminal_scope(profile_home: str):
     environment-selection path resolve THIS turn's policy from task-local
     context, immune to the sibling environ writes — mirroring the
     Hermes-home override above for the terminal/file side.
+
+    Launch-profile parity with the multiplexed gateway (review of #7861): a
+    deployment started with an env-only terminal policy (TERMINAL_ENV=ssh from
+    systemd / op run / a launcher bridge) has no file to rebuild that policy
+    from, so a file-built scope would silently downgrade it to the default
+    backend. The launch TERMINAL_* environment is therefore frozen once at
+    module import — before any per-turn environ mutation can run — and
+    overlaid ONLY when this turn's home IS the process-owning home. Routed
+    secondary homes keep the no-overlay call: they must not borrow the launch
+    profile's env policy. Live os.environ is never read at turn entry (a
+    sibling turn may be mirroring its values there — the exact race the
+    scope removes).
+
     Returns ``(module, token, installed)``; never raises.
     """
     if not profile_home:
@@ -3278,7 +3343,12 @@ def _set_streaming_terminal_scope(profile_home: str):
         return None, None, False
 
     try:
-        _token = _scope_mod.install_profile_terminal_scope(profile_home)
+        _overlay = None
+        if _is_process_owning_home(profile_home):
+            _overlay = _frozen_launch_terminal_env()
+        _token = _scope_mod.install_profile_terminal_scope(
+            profile_home, env_overlay=_overlay
+        )
         return _scope_mod, _token, True
     except Exception:
         logger.debug(
