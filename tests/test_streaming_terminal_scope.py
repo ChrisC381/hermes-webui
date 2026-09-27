@@ -218,3 +218,125 @@ def test_streaming_helpers_bind_and_reset_the_scope(tmp_path, monkeypatch):
     # Degenerate inputs stay no-ops, never raise.
     assert _set_streaming_terminal_scope("") == (None, None, False)
     _reset_streaming_terminal_scope(None, None, False)
+
+
+@pytest.mark.skipif(not HAS_SCOPE, reason="requires scope machinery")
+def test_launch_env_only_policy_survives_scope_binding(tmp_path, monkeypatch):
+    """Review of #7861, case 1: a deployment launched with an env-only
+    terminal backend (TERMINAL_ENV=ssh from systemd / op run / a launcher
+    bridge — no config.yaml / .env entry) must KEEP that policy once the
+    turn binds a scope, while a routed secondary profile with no files of
+    its own must resolve its own default instead of borrowing the launch
+    env. The overlay is the FROZEN launch snapshot — a later live environ
+    write must not leak into the owning turn (never read os.environ at
+    turn entry)."""
+    import api.profiles as api_profiles
+    import api.streaming as streaming
+
+    launch_home = tmp_path / "launch"
+    launch_home.mkdir()
+    (launch_home / "config.yaml").write_text(
+        "model:\n  default: test-model\n", encoding="utf-8"
+    )  # NO terminal: section — the policy exists only in the launch env
+    secondary_home = tmp_path / "secondary"
+    secondary_home.mkdir()  # empty profile: no config.yaml at all
+
+    monkeypatch.delenv("TERMINAL_ENV", raising=False)
+    monkeypatch.delenv("TERMINAL_SSH_HOST", raising=False)
+
+    _saved_snapshot = dict(streaming._LAUNCH_TERMINAL_ENV_SNAPSHOT)
+    streaming._LAUNCH_TERMINAL_ENV_SNAPSHOT.clear()  # deterministic first capture
+    try:
+        # The launch process's env-only policy, present before any turn ran.
+        monkeypatch.setenv("TERMINAL_ENV", "ssh")
+        monkeypatch.setenv("TERMINAL_SSH_HOST", "bridge-host")
+        streaming._capture_launch_terminal_env()
+
+        # A sibling turn mutates the shared environ AFTER the freeze: the
+        # owning turn must not see this (frozen snapshot, not live reads).
+        os.environ["TERMINAL_ENV"] = "docker"
+
+        # The launch home IS the process-owning home.
+        monkeypatch.setattr(api_profiles, "_PROCESS_PROFILE_HOME", str(launch_home))
+        scope_mod, token, installed = streaming._set_streaming_terminal_scope(
+            str(launch_home)
+        )
+        try:
+            assert installed, "helper must install for the owning home"
+            assert (
+                terminal_scope.terminal_env("TERMINAL_ENV", "local") == "ssh"
+            ), "env-only launch policy lost when the scope bound (file-built default won)"
+            assert (
+                terminal_scope.terminal_env("TERMINAL_SSH_HOST", "") == "bridge-host"
+            ), "launch overlay var missing from the owning-home scope"
+            assert (
+                terminal_scope.terminal_env("TERMINAL_ENV", "local") != "docker"
+            ), "post-freeze sibling environ write leaked into the owning turn"
+        finally:
+            streaming._reset_streaming_terminal_scope(scope_mod, token, installed)
+
+        # Routed secondary: empty profile resolves its own default and does
+        # NOT borrow the launch env overlay.
+        scope_mod2, token2, installed2 = streaming._set_streaming_terminal_scope(
+            str(secondary_home)
+        )
+        try:
+            assert installed2
+            assert (
+                terminal_scope.terminal_env("TERMINAL_ENV", "local") == "local"
+            ), "routed secondary borrowed the launch profile's env-only policy"
+        finally:
+            streaming._reset_streaming_terminal_scope(scope_mod2, token2, installed2)
+    finally:
+        os.environ.pop("TERMINAL_ENV", None)
+        streaming._LAUNCH_TERMINAL_ENV_SNAPSHOT.clear()
+        streaming._LAUNCH_TERMINAL_ENV_SNAPSHOT.update(_saved_snapshot)
+
+
+@pytest.mark.skipif(not HAS_SCOPE, reason="requires scope machinery")
+def test_scope_reaches_context_copying_worker(tmp_path, monkeypatch):
+    """Review of #7861, case 2: the streaming parent installs the scope and
+    the Agent's tool workers run under ``contextvars.copy_context()`` (the
+    agent's context-propagating worker seam — agent/deadline.py,
+    agent/memory_provider.py). A reader executed in a fresh thread under the
+    COPIED context must see the parent turn's policy, not the shared
+    os.environ. The prior concurrency test proved sibling isolation but
+    installed the scope inside the reading thread itself — it did not prove
+    parent-to-worker propagation."""
+    import api.streaming as streaming
+    import contextvars
+
+    home_a = _seed_profile_home(tmp_path, "alpha", backend="docker")
+
+    monkeypatch.delenv("TERMINAL_ENV", raising=False)
+
+    scope_mod, token, installed = streaming._set_streaming_terminal_scope(str(home_a))
+    try:
+        assert installed
+        # Sibling export live in the shared environ while the worker runs.
+        os.environ["TERMINAL_ENV"] = "local"
+
+        ctx = contextvars.copy_context()
+        results = {}
+
+        def worker_reader():
+            # Inside the Agent worker: no scope install of its own; policy
+            # must arrive via the copied context.
+            results["backend"] = terminal_scope.terminal_env("TERMINAL_ENV", "local")
+            results["scope_present"] = terminal_scope.get_terminal_scope() is not None
+
+        worker = threading.Thread(target=lambda: ctx.run(worker_reader))
+        worker.start()
+        worker.join(timeout=10)
+        assert not worker.is_alive(), "worker thread hung"
+
+        assert results.get("scope_present") is True, (
+            "worker context saw no bound scope — parent install did not propagate"
+        )
+        assert results.get("backend") == "docker", (
+            "worker resolved the sibling environ export instead of the "
+            f"parent turn's policy: {results.get('backend')!r}"
+        )
+    finally:
+        os.environ.pop("TERMINAL_ENV", None)
+        streaming._reset_streaming_terminal_scope(scope_mod, token, installed)
