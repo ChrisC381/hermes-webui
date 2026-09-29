@@ -188,6 +188,7 @@ def test_concurrent_turns_keep_their_own_policies(tmp_path, monkeypatch):
     t_a.join(timeout=10)
     t_b.join(timeout=10)
 
+    assert not errors, f"turn thread(s) failed: {errors}"
     assert results.get("a_backend") == "local", (
         "concurrent local-profile turn resolved the docker-profile sibling's "
         f"environ export: {results.get('a_backend')!r}"
