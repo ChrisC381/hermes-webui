@@ -3306,7 +3306,7 @@ def _is_process_owning_home(profile_home: str) -> bool:
         return False
 
 
-def _set_streaming_terminal_scope(profile_home: str):
+def _set_streaming_terminal_scope(profile_home: str, turn_overlay: Optional[dict] = None):
     """Install the turn's profile terminal policy as context-local state.
 
     The runtime env export below applies each profile's TERMINAL_* settings via
@@ -3333,7 +3333,26 @@ def _set_streaming_terminal_scope(profile_home: str):
     sibling turn may be mirroring its values there — the exact race the
     scope removes).
 
-    Returns ``(module, token, installed)``; never raises.
+    Turn-effective values (review of #7861, round 2): once a policy scope is
+    bound, terminal_env() reads ONLY the scope — everything the turn used to
+    put into the thread/process env becomes invisible. Two WebUI behaviours
+    must therefore be re-projected onto the scope, applied last so they win
+    exactly as they won in the pre-PR env mirror:
+
+    * TERMINAL_CWD = the session workspace (s.workspace). The file-built
+      scope resolves the profile cwd or the home dir; without this overlay
+      every command in a WebUI turn would run in the wrong directory.
+    * The turn's effective TERMINAL_* values from the profile runtime env
+      (_safe_profile_runtime_env). WebUI applies the profile .env AFTER
+      config.yaml, so .env wins in the mirror; the Agent's scope builder
+      applies config.yaml last, so YAML would win in the scope. Overlaying
+      the runtime env restores WebUI's precedence and keeps any .env
+      terminal override working.
+
+    Only TERMINAL_* keys from *turn_overlay* are applied (non-terminal keys
+    are the thread-env's business, not the terminal policy's). Never raises.
+
+    Returns ``(module, token, installed)``.
     """
     if not profile_home:
         return None, None, False
@@ -3346,9 +3365,26 @@ def _set_streaming_terminal_scope(profile_home: str):
         _overlay = None
         if _is_process_owning_home(profile_home):
             _overlay = _frozen_launch_terminal_env()
-        _token = _scope_mod.install_profile_terminal_scope(
-            profile_home, env_overlay=_overlay
-        )
+        try:
+            _scope = _scope_mod.build_profile_terminal_scope(
+                profile_home, env_overlay=_overlay
+            )
+        except Exception:
+            # Profile policy unreadable (TerminalPolicyUnavailable): keep the
+            # Agent's fail-closed refusal scope — never silently widen back to
+            # the environ mirror. The turn overlay is not applied; the policy
+            # it would modify is unavailable. (install_... never raises.)
+            _token = _scope_mod.install_profile_terminal_scope(
+                profile_home, env_overlay=_overlay
+            )
+            return _scope_mod, _token, True
+        if turn_overlay:
+            _scope.update(
+                (str(k), str(v))
+                for k, v in turn_overlay.items()
+                if str(k).startswith("TERMINAL_")
+            )
+        _token = _scope_mod.set_terminal_scope(_scope)
         return _scope_mod, _token, True
     except Exception:
         logger.debug(
@@ -10605,7 +10641,18 @@ def _run_agent_streaming(
             _profile_home,
         )
         _streaming_hermes_home_override_ctx = _set_streaming_hermes_home_override(_profile_home)
-        _streaming_terminal_scope_ctx = _set_streaming_terminal_scope(_profile_home)
+        # Turn-effective TERMINAL_* values, re-projected onto the bound scope
+        # (review of #7861 round 2): the profile runtime env (WebUI resolves
+        # .env after config.yaml, so .env wins — the Agent's file-built scope
+        # would invert that) plus the session workspace as TERMINAL_CWD (the
+        # scope would otherwise resolve the profile cwd / home dir). Order
+        # matches the environ mirror below: runtime env first, then the
+        # workspace wins, exactly as before this PR.
+        _turn_terminal_overlay = dict(_safe_profile_runtime_env or {})
+        _turn_terminal_overlay['TERMINAL_CWD'] = str(s.workspace)
+        _streaming_terminal_scope_ctx = _set_streaming_terminal_scope(
+            _profile_home, turn_overlay=_turn_terminal_overlay
+        )
         _set_thread_env(**_thread_env)
         # process_complete agent-wakeup wiring (ours-original, Option B): bind
         # this session's HERMES_SESSION_KEY to its WebUI session_id so the
