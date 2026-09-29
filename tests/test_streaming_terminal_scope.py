@@ -294,6 +294,182 @@ def test_launch_env_only_policy_survives_scope_binding(tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(not HAS_SCOPE, reason="requires scope machinery")
+def test_scoped_turn_runs_in_session_workspace(tmp_path, monkeypatch):
+    """Review of #7861 round 2, case 1: with the profile scope bound, a
+    terminal command must run in the session WORKSPACE. The file-built scope
+    resolves the profile's cwd (or home); without the turn overlay every
+    WebUI command would run in the wrong directory. Exercised end-to-end
+    through the agent's own cwd resolver (resolve_agent_cwd), which is what
+    terminal_tool uses for command cwd."""
+    import api.streaming as streaming
+
+    # Profile home with terminal.cwd pinned to a DIFFERENT directory.
+    home = tmp_path / "alpha"
+    home.mkdir()
+    pinned_cwd = tmp_path / "pinned-by-config"
+    pinned_cwd.mkdir()
+    workspace = tmp_path / "session-workspace"
+    workspace.mkdir()
+    (home / "config.yaml").write_text(
+        textwrap.dedent(
+            f"""\
+            model:
+              default: test-model
+            terminal:
+              backend: local
+              cwd: {pinned_cwd}
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+
+    # Turn overlay: runtime env (empty here) + workspace as TERMINAL_CWD —
+    # exactly what the streaming call site passes.
+    overlay = {"TERMINAL_CWD": str(workspace)}
+    scope_mod, token, installed = streaming._set_streaming_terminal_scope(
+        str(home), turn_overlay=overlay
+    )
+    try:
+        assert installed
+        from agent.runtime_cwd import resolve_agent_cwd
+        assert str(resolve_agent_cwd()) == str(workspace), (
+            "scoped turn resolved the profile-pinned cwd "
+            f"({pinned_cwd}) instead of the session workspace ({workspace})"
+        )
+    finally:
+        streaming._reset_streaming_terminal_scope(scope_mod, token, installed)
+
+    # Negative control: WITHOUT the overlay the file-built scope wins and the
+    # turn would run in the profile-pinned cwd — the bug her review found.
+    scope_mod2, token2, installed2 = streaming._set_streaming_terminal_scope(str(home))
+    try:
+        assert installed2
+        from agent.runtime_cwd import resolve_agent_cwd as rac2
+        assert str(rac2()) == str(pinned_cwd)
+    finally:
+        streaming._reset_streaming_terminal_scope(scope_mod2, token2, installed2)
+
+
+@pytest.mark.skipif(not HAS_SCOPE, reason="requires scope machinery")
+def test_env_override_beats_yaml_in_scope(tmp_path, monkeypatch):
+    """Review of #7861 round 2, case 2: WebUI applies the profile .env AFTER
+    config.yaml, so .env wins in the pre-PR env mirror. The Agent's scope
+    builder applies config.yaml last (YAML wins). The turn overlay must
+    restore WebUI's precedence: a .env TERMINAL_ENV=docker override keeps
+    working under the bound scope despite config.yaml backend: local."""
+    import api.streaming as streaming
+
+    home = tmp_path / "alpha"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        textwrap.dedent(
+            """\
+            model:
+              default: test-model
+            terminal:
+              backend: local
+            """
+        ),
+        encoding="utf-8",
+    )
+    (home / ".env").write_text("TERMINAL_ENV=docker\n", encoding="utf-8")
+
+    monkeypatch.delenv("TERMINAL_ENV", raising=False)
+
+    # What the streaming call site passes: the profile runtime env as WebUI
+    # resolved it (.env applied after config.yaml -> docker) plus workspace.
+    overlay = {"TERMINAL_ENV": "docker", "TERMINAL_CWD": str(tmp_path)}
+    scope_mod, token, installed = streaming._set_streaming_terminal_scope(
+        str(home), turn_overlay=overlay
+    )
+    try:
+        assert installed
+        assert terminal_scope.terminal_env("TERMINAL_ENV", "local") == "docker", (
+            "profile .env terminal override lost under the bound scope — "
+            "config.yaml precedence inverted WebUI's resolution order"
+        )
+    finally:
+        streaming._reset_streaming_terminal_scope(scope_mod, token, installed)
+
+    # Negative control: without the overlay, the Agent's file-built scope
+    # applies config.yaml last and resolves local — the precedence inversion.
+    scope_mod2, token2, installed2 = streaming._set_streaming_terminal_scope(str(home))
+    try:
+        assert installed2
+        assert terminal_scope.terminal_env("TERMINAL_ENV", "local") == "local"
+    finally:
+        streaming._reset_streaming_terminal_scope(scope_mod2, token2, installed2)
+
+
+@pytest.mark.skipif(not HAS_SCOPE, reason="requires scope machinery")
+def test_turn_overlay_terminal_only_and_refusal_kept(tmp_path, monkeypatch):
+    """Overlay hygiene: only TERMINAL_* keys from the turn overlay are
+    applied (non-terminal thread-env keys must not enter the terminal
+    policy), and an unreadable profile policy keeps the fail-closed refusal
+    scope — the overlay never widens a refusal into a working policy."""
+    import api.streaming as streaming
+
+    home = tmp_path / "alpha"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "model:\n  default: test-model\nterminal:\n  backend: local\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.delenv("TERMINAL_ENV", raising=False)
+    overlay = {
+        "TERMINAL_ENV": "ssh",
+        "TERMINAL_SSH_HOST": "bridge-host",
+        "HERMES_SESSION_KEY": "must-not-enter-the-scope",  # non-terminal key
+    }
+    scope_mod, token, installed = streaming._set_streaming_terminal_scope(
+        str(home), turn_overlay=overlay
+    )
+    try:
+        assert installed
+        scope = terminal_scope.get_terminal_scope()
+        assert isinstance(scope, dict)
+        assert scope.get("TERMINAL_ENV") == "ssh"
+        assert "HERMES_SESSION_KEY" not in scope, (
+            "non-terminal key leaked into the terminal policy scope"
+        )
+        # The refusal-scope guard: terminal_env() on a POLICY scope answers
+        # normally (proves this is a policy, not a refusal).
+        assert terminal_scope.terminal_env("TERMINAL_SSH_HOST", "") == "bridge-host"
+    finally:
+        streaming._reset_streaming_terminal_scope(scope_mod, token, installed)
+
+    # Unreadable profile policy -> refusal scope, overlay or not. The
+    # TerminalPolicyUnavailable path is triggered directly (a directory in
+    # place of config.yaml makes .exists() True and the open() fail), which
+    # is deterministic regardless of filesystem permissions/running-as-root.
+    bad_home = tmp_path / "unreadable"
+    bad_home.mkdir()
+    (bad_home / "config.yaml").mkdir()  # a DIRECTORY: present but unreadable
+    scope_mod3, token3, installed3 = streaming._set_streaming_terminal_scope(
+        str(bad_home), turn_overlay={"TERMINAL_ENV": "ssh"}
+    )
+    try:
+        assert installed3
+        from tools.terminal_scope import TerminalPolicyRefusal
+        scope3 = terminal_scope.get_terminal_scope()
+        assert isinstance(scope3, TerminalPolicyRefusal), (
+            f"unreadable profile policy must keep the fail-closed refusal scope, got {type(scope3).__name__}"
+        )
+        # The refusal must refuse: terminal_env() raises rather than answering.
+        raised = False
+        try:
+            terminal_scope.terminal_env("TERMINAL_ENV", "local")
+        except Exception:
+            raised = True
+        assert raised, "refusal scope answered instead of refusing"
+    finally:
+        streaming._reset_streaming_terminal_scope(scope_mod3, token3, installed3)
+
+
+@pytest.mark.skipif(not HAS_SCOPE, reason="requires scope machinery")
 def test_scope_reaches_context_copying_worker(tmp_path, monkeypatch):
     """Review of #7861, case 2: the streaming parent installs the scope and
     the Agent's tool workers run under ``contextvars.copy_context()`` (the
