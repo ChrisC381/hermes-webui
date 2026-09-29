@@ -151,7 +151,8 @@ def test_concurrent_turns_keep_their_own_policies(tmp_path, monkeypatch):
 
     monkeypatch.delenv("TERMINAL_ENV", raising=False)
     results = {}
-    barrier = threading.Barrier(2)
+    errors = {}
+    barrier = threading.Barrier(2, timeout=10)
 
     def turn_a():
         token = terminal_scope.install_profile_terminal_scope(home_a)
@@ -160,6 +161,8 @@ def test_concurrent_turns_keep_their_own_policies(tmp_path, monkeypatch):
             barrier.wait()  # B's export is now live
             results["a_backend"] = terminal_scope.terminal_env("TERMINAL_ENV", "local")
             barrier.wait()  # A has recorded its result; B may now clean up
+        except Exception as exc:  # a failed turn must never wedge its sibling
+            errors["a"] = repr(exc)
         finally:
             terminal_scope.reset_terminal_scope(token)
 
@@ -168,11 +171,13 @@ def test_concurrent_turns_keep_their_own_policies(tmp_path, monkeypatch):
         # streaming path: agent runs unlocked). The export STAYS in the
         # environ until A has recorded its read — removing it earlier would
         # let the test pass on a cleaned environ even with no scope bound.
-        barrier.wait()
-        os.environ["TERMINAL_ENV"] = "docker"  # sibling B's export (docker)
         try:
             barrier.wait()
+            os.environ["TERMINAL_ENV"] = "docker"  # sibling B's export (docker)
             barrier.wait()
+            barrier.wait()
+        except Exception as exc:
+            errors["b"] = repr(exc)
         finally:
             os.environ.pop("TERMINAL_ENV", None)
 
