@@ -3260,21 +3260,53 @@ def _resolve_streaming_terminal_scope_module():
 # file to rebuild that policy from; this snapshot is the only way a bound
 # scope can keep it. Mirrors tui_gateway/launch_terminal_policy.py in the
 # Hermes agent (first capture wins, never re-read from ambient state).
+#
+# The snapshot is a LOAN to the home that owned the process at capture time
+# (review of #7861, round 3): switch_profile(..., process_wide=True) re-pins
+# the process owner to a different profile home, and that new profile must
+# not inherit the previous deployment's env-only terminal policy. Recording
+# the captured owner and comparing against the live process owner keeps the
+# overlay with the deployment it belongs to (a switch back restores it; the
+# snapshot itself is never destroyed or refreshed).
 _LAUNCH_TERMINAL_ENV_SNAPSHOT: dict = {}
+_LAUNCH_TERMINAL_ENV_OWNER: Optional[str] = None
 
 
 def _capture_launch_terminal_env() -> dict:
     """Freeze the process's TERMINAL_* env; the first capture wins."""
-    global _LAUNCH_TERMINAL_ENV_SNAPSHOT
+    global _LAUNCH_TERMINAL_ENV_SNAPSHOT, _LAUNCH_TERMINAL_ENV_OWNER
     if not _LAUNCH_TERMINAL_ENV_SNAPSHOT:
         _LAUNCH_TERMINAL_ENV_SNAPSHOT = {
             k: v for k, v in os.environ.items() if k.startswith("TERMINAL_")
         }
+        try:
+            from api.profiles import get_process_profile_home
+
+            _LAUNCH_TERMINAL_ENV_OWNER = os.path.realpath(
+                str(get_process_profile_home())
+            )
+        except Exception:
+            _LAUNCH_TERMINAL_ENV_OWNER = None
     return dict(_LAUNCH_TERMINAL_ENV_SNAPSHOT)
 
 
 def _frozen_launch_terminal_env() -> dict:
-    """The frozen launch TERMINAL_* overlay (empty when nothing was captured)."""
+    """The frozen launch TERMINAL_* overlay for the CURRENT process owner.
+
+    Empty unless the process is still owned by the home that owned it when
+    the snapshot was captured: a process-wide profile switch means the new
+    owner's policy comes from its own files, not the old deployment's env.
+    """
+    if not _LAUNCH_TERMINAL_ENV_SNAPSHOT or _LAUNCH_TERMINAL_ENV_OWNER is None:
+        return {}
+    try:
+        from api.profiles import get_process_profile_home
+
+        _current = os.path.realpath(str(get_process_profile_home()))
+    except Exception:
+        return {}
+    if _current != _LAUNCH_TERMINAL_ENV_OWNER:
+        return {}
     return dict(_LAUNCH_TERMINAL_ENV_SNAPSHOT)
 
 
