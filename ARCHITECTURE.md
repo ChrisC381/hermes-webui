@@ -175,7 +175,13 @@ Per-turn terminal policy scope (agents that expose tools.terminal_scope):
     the turn's effective values are applied last so they win exactly as
     they won in the env mirror: the profile runtime env (WebUI applies
     .env after config.yaml, so .env wins) and TERMINAL_CWD = the session
-    workspace. On agents without the scope machinery the env mirror above
+    workspace. For the process-owning home, the launch process's frozen
+    TERMINAL_* environment (env-only policies with no file to rebuild
+    from) is overlaid — but only while the process owner is still the
+    home that owned it at capture: a process-wide profile switch means
+    the new owner's policy comes from its own files, not the previous
+    deployment's env (the snapshot is owner-anchored; switching back
+    restores it). On agents without the scope machinery the env mirror above
     remains the only mechanism (unchanged fallback); on a profile whose
     policy files cannot be read the agent's fail-closed refusal scope
     applies (terminal tools refuse rather than run on ambient env).
