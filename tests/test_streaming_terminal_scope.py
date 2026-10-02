@@ -251,8 +251,13 @@ def test_launch_env_only_policy_survives_scope_binding(tmp_path, monkeypatch):
     monkeypatch.delenv("TERMINAL_SSH_HOST", raising=False)
 
     _saved_snapshot = dict(streaming._LAUNCH_TERMINAL_ENV_SNAPSHOT)
+    _saved_owner = streaming._LAUNCH_TERMINAL_ENV_OWNER
     streaming._LAUNCH_TERMINAL_ENV_SNAPSHOT.clear()  # deterministic first capture
     try:
+        # Startup order: init_profile_state() pins the process owner BEFORE
+        # the import-time freeze, so the capture records alpha as the owner.
+        monkeypatch.setattr(api_profiles, "_PROCESS_PROFILE_HOME", str(launch_home))
+
         # The launch process's env-only policy, present before any turn ran.
         monkeypatch.setenv("TERMINAL_ENV", "ssh")
         monkeypatch.setenv("TERMINAL_SSH_HOST", "bridge-host")
@@ -263,7 +268,6 @@ def test_launch_env_only_policy_survives_scope_binding(tmp_path, monkeypatch):
         os.environ["TERMINAL_ENV"] = "docker"
 
         # The launch home IS the process-owning home.
-        monkeypatch.setattr(api_profiles, "_PROCESS_PROFILE_HOME", str(launch_home))
         scope_mod, token, installed = streaming._set_streaming_terminal_scope(
             str(launch_home)
         )
@@ -297,6 +301,84 @@ def test_launch_env_only_policy_survives_scope_binding(tmp_path, monkeypatch):
         os.environ.pop("TERMINAL_ENV", None)
         streaming._LAUNCH_TERMINAL_ENV_SNAPSHOT.clear()
         streaming._LAUNCH_TERMINAL_ENV_SNAPSHOT.update(_saved_snapshot)
+        streaming._LAUNCH_TERMINAL_ENV_OWNER = _saved_owner
+
+
+@pytest.mark.skipif(not HAS_SCOPE, reason="requires scope machinery")
+def test_process_wide_switch_does_not_inherit_launch_policy(tmp_path, monkeypatch):
+    """Review of #7861, round 3 ([CORE]): the frozen launch TERMINAL_*
+    snapshot is a loan to the home that owned the process when it was
+    captured. After switch_profile(..., process_wide=True) re-pins the
+    process owner to a new profile home, that new profile must resolve
+    NEITHER the old deployment's env-only backend nor its host — its turns
+    build policy from its own files (empty profile -> defaults), while a
+    switch BACK to the captured owner must restore the full launch policy
+    (the snapshot is owner-anchored, never destroyed)."""
+    import api.profiles as api_profiles
+    import api.streaming as streaming
+
+    launch_home = tmp_path / "alpha"
+    launch_home.mkdir()
+    (launch_home / "config.yaml").write_text(
+        "model:\n  default: test-model\n", encoding="utf-8"
+    )  # NO terminal: section — the env-only ssh policy exists only at launch
+    beta_home = tmp_path / "beta"
+    beta_home.mkdir()  # no terminal settings of its own
+
+    monkeypatch.delenv("TERMINAL_ENV", raising=False)
+    monkeypatch.delenv("TERMINAL_SSH_HOST", raising=False)
+
+    _saved_snapshot = dict(streaming._LAUNCH_TERMINAL_ENV_SNAPSHOT)
+    _saved_owner = streaming._LAUNCH_TERMINAL_ENV_OWNER
+    streaming._LAUNCH_TERMINAL_ENV_SNAPSHOT.clear()  # deterministic first capture
+    try:
+        # The deployment launched with an env-only ssh policy, owned by
+        # alpha: the owner pin is set at startup, BEFORE the import-time
+        # freeze, so the capture records alpha as the snapshot's owner.
+        monkeypatch.setattr(api_profiles, "_PROCESS_PROFILE_HOME", str(launch_home))
+        monkeypatch.setenv("TERMINAL_ENV", "ssh")
+        monkeypatch.setenv("TERMINAL_SSH_HOST", "prod.example")
+        streaming._capture_launch_terminal_env()
+
+        # switch_profile(..., process_wide=True) re-pins the owner to beta.
+        monkeypatch.setattr(api_profiles, "_PROCESS_PROFILE_HOME", str(beta_home))
+
+        # A beta turn binds its scope: it must NOT inherit the launch policy.
+        scope_mod, token, installed = streaming._set_streaming_terminal_scope(
+            str(beta_home)
+        )
+        try:
+            assert installed, "helper must install for the new process owner"
+            assert (
+                terminal_scope.terminal_env("TERMINAL_ENV", "local") != "ssh"
+            ), "new profile inherited the old deployment's env-only backend"
+            assert (
+                terminal_scope.terminal_env("TERMINAL_SSH_HOST", "") == ""
+            ), "new profile inherited the old deployment's ssh host"
+        finally:
+            streaming._reset_streaming_terminal_scope(scope_mod, token, installed)
+
+        # Switching back: the captured owner gets its launch policy again.
+        monkeypatch.setattr(api_profiles, "_PROCESS_PROFILE_HOME", str(launch_home))
+        scope_mod2, token2, installed2 = streaming._set_streaming_terminal_scope(
+            str(launch_home)
+        )
+        try:
+            assert installed2
+            assert (
+                terminal_scope.terminal_env("TERMINAL_ENV", "local") == "ssh"
+            ), "return to the captured owner lost the launch env policy"
+            assert (
+                terminal_scope.terminal_env("TERMINAL_SSH_HOST", "") == "prod.example"
+            ), "return to the captured owner lost the launch ssh host"
+        finally:
+            streaming._reset_streaming_terminal_scope(scope_mod2, token2, installed2)
+    finally:
+        os.environ.pop("TERMINAL_ENV", None)
+        os.environ.pop("TERMINAL_SSH_HOST", None)
+        streaming._LAUNCH_TERMINAL_ENV_SNAPSHOT.clear()
+        streaming._LAUNCH_TERMINAL_ENV_SNAPSHOT.update(_saved_snapshot)
+        streaming._LAUNCH_TERMINAL_ENV_OWNER = _saved_owner
 
 
 @pytest.mark.skipif(not HAS_SCOPE, reason="requires scope machinery")
